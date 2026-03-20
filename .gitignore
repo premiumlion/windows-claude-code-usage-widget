@@ -15,5 +15,10 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
 # Widget state (user-specific position/preferences)
 # Note: this file lives in ~/.claude/, not in the repo
