@@ -298,6 +298,7 @@ class UsageWidget:
             self.expanded = False
         if not state.get("alltime_expanded", True):
             self.alltime_expanded = False
+        self._font_offset = state.get("font_offset", 0)
         # Section visibility (default all visible)
         vis = state.get("visible", {})
         self._visible = {
@@ -358,6 +359,10 @@ class UsageWidget:
             self.root.geometry(f"+{sw - self._widget_width - 16}+{sh - 400}")
 
         self._lock_width()
+
+        # Apply persisted font offset
+        if self._font_offset != 0:
+            self._adjust_all_fonts(self._font_offset)
 
         # Load cached usage data immediately (no API hit)
         cached = load_usage_cache()
@@ -509,7 +514,16 @@ class UsageWidget:
             "expanded": self.expanded,
             "alltime_expanded": self.alltime_expanded,
             "visible": self._visible,
+            "font_offset": self._font_offset,
         })
+
+    def _font(self, size, weight=None):
+        """Return font tuple with offset applied, and store base size in the tuple.
+        Uses negative font size convention: we encode base in a custom attr after creation."""
+        adjusted = max(5, size + self._font_offset)
+        if weight:
+            return ("Segoe UI", adjusted, weight)
+        return ("Segoe UI", adjusted)
 
     # ─── Settings menu ────────────────────────────────────────────
 
@@ -528,6 +542,11 @@ class UsageWidget:
             prefix = "✓ " if self._visible[key] else "   "
             menu.add_command(label=f"{prefix}{label}",
                              command=lambda k=key: self._toggle_section(k))
+        menu.add_separator()
+        menu.add_command(label=f"  Font +  (current: {self._font_offset:+d})",
+                         command=self._font_increase)
+        menu.add_command(label=f"  Font −  (current: {self._font_offset:+d})",
+                         command=self._font_decrease)
         menu.tk_popup(event.x_root, event.y_root)
 
     def _toggle_section(self, key):
@@ -538,6 +557,36 @@ class UsageWidget:
         else:
             frame.pack_forget()
         self._persist_state()
+
+    def _font_increase(self):
+        self._adjust_all_fonts(1)
+        self._font_offset += 1
+        self._persist_state()
+
+    def _font_decrease(self):
+        self._adjust_all_fonts(-1)
+        self._font_offset -= 1
+        self._persist_state()
+
+    def _adjust_all_fonts(self, delta):
+        self._adjust_fonts_recursive(self.root, delta)
+
+    def _adjust_fonts_recursive(self, widget, delta):
+        try:
+            raw = widget.cget("font")
+            if raw and "Segoe" in str(raw):
+                parts = widget.tk.splitlist(raw)
+                family = parts[0]
+                size = int(parts[1])
+                new_size = max(5, size + delta)
+                if len(parts) > 2:
+                    widget.config(font=(family, new_size, parts[2]))
+                else:
+                    widget.config(font=(family, new_size))
+        except (tk.TclError, AttributeError, IndexError, ValueError):
+            pass
+        for child in widget.winfo_children():
+            self._adjust_fonts_recursive(child, delta)
 
     # ─── Throb animation ──────────────────────────────────────────────
 
