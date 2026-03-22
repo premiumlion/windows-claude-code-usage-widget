@@ -18,6 +18,8 @@ Run:  pythonw claude-usage-widget.pyw   (no console window)
 
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -200,6 +202,37 @@ def format_reset_time(iso_str):
         return ""
 
 
+# ─── Version checking ─────────────────────────────────────────────────────────
+
+VERSION_CHECK_MS = 3600_000  # check once per hour
+CHANGELOG_URL = "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md"
+
+
+def get_local_claude_version():
+    """Get locally installed Claude Code version."""
+    try:
+        result = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        match = re.search(r"(\d+\.\d+\.\d+)", result.stdout)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+def get_latest_claude_version():
+    """Fetch latest version from public GitHub changelog."""
+    try:
+        req = urllib.request.Request(CHANGELOG_URL)
+        resp = urllib.request.urlopen(req, timeout=10)
+        text = resp.read(2000).decode()
+        match = re.search(r"##\s+(\d+\.\d+\.\d+)", text)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
 # ─── Single instance ──────────────────────────────────────────────────────────
 
 LOCK_FILE = CLAUDE_DIR / "widget.lock"
@@ -282,6 +315,8 @@ class UsageWidget:
         self._throb_active = False
         self._throb_step = 0
         self._usage_backoff = USAGE_REFRESH_MS
+        self._local_version = None
+        self._latest_version = None
 
         # Credentials
         creds = load_credentials()
@@ -306,6 +341,7 @@ class UsageWidget:
             "weekly": vis.get("weekly", True),
             "sonnet": vis.get("sonnet", True),
             "alltime": vis.get("alltime", True),
+            "version": vis.get("version", True),
         }
 
         # ─── Layout: body (top) → header (bottom) ──────────────────
@@ -373,6 +409,7 @@ class UsageWidget:
         # Initial data + start async loops
         self._refresh_async()
         self._fetch_usage_async()
+        self._check_version_async()
 
     def _lock_width(self):
         self.root.minsize(self._widget_width, 0)
@@ -532,6 +569,7 @@ class UsageWidget:
         "weekly": ("Weekly (7d)", "_weekly_frame"),
         "sonnet": ("Sonnet (7d)", "_sonnet_frame"),
         "alltime": ("All-time", "_alltime_section"),
+        "version": ("Version", "_version_frame"),
     }
 
     def _show_menu(self, event):
@@ -710,6 +748,19 @@ class UsageWidget:
         self.ts_label = tk.Label(self._ts_row, text="", font=("Segoe UI", 7),
                                  fg=FG_DIM, bg=BG, anchor="e")
         self.ts_label.pack(side="right")
+
+        # Version row
+        self._version_frame = tk.Frame(self.body, bg=BG)
+        if self._visible.get("version", True):
+            self._version_frame.pack(fill="x", pady=(2, 0))
+        self._version_lbl = tk.Label(self._version_frame, text="",
+                                     font=("Segoe UI", 7), fg=FG_DIM,
+                                     bg=BG, anchor="w")
+        self._version_lbl.pack(side="left")
+        self._update_lbl = tk.Label(self._version_frame, text="",
+                                    font=("Segoe UI", 7, "bold"),
+                                    fg=FG_ORANGE, bg=BG, anchor="e")
+        self._update_lbl.pack(side="right")
 
     def _sep(self):
         tk.Frame(self.body, height=1, bg=BORDER).pack(fill="x", pady=3)
@@ -934,6 +985,28 @@ class UsageWidget:
         self._set_bar("usage_sonnet_bar", "usage_sonnet_lbl",
                        "usage_sonnet_detail",
                        ss.get("utilization", 0), ss.get("resets_at"))
+
+    # ─── Version check ────────────────────────────────────────────
+
+    def _check_version_async(self):
+        def _work():
+            local = get_local_claude_version()
+            latest = get_latest_claude_version()
+            self.root.after(0, self._apply_version, local, latest)
+        threading.Thread(target=_work, daemon=True).start()
+        self.root.after(VERSION_CHECK_MS, self._check_version_async)
+
+    def _apply_version(self, local, latest):
+        self._local_version = local
+        self._latest_version = latest
+        if local:
+            self._version_lbl.config(text=f"v{local}")
+        else:
+            self._version_lbl.config(text="")
+        if local and latest and latest != local:
+            self._update_lbl.config(text=f"update: v{latest}", fg=FG_ORANGE)
+        else:
+            self._update_lbl.config(text="")
 
     def run(self):
         self.root.mainloop()
