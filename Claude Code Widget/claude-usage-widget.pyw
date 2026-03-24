@@ -37,11 +37,11 @@ STATE_FILE = CLAUDE_DIR / "widget-state.json"
 USAGE_CACHE_FILE = CLAUDE_DIR / "widget-usage-cache.json"
 CREDS_FILE = CLAUDE_DIR / ".credentials.json"
 REFRESH_MS = 30_000
-USAGE_REFRESH_MS = 120_000  # usage API every 2 min (rate-limited)
+USAGE_REFRESH_MS = 300_000  # usage API every 5 min (avoid throttling)
 DEFAULT_WIDTH = 280
 MIN_WIDTH = 200
 MAX_WIDTH = 500
-WIDGET_OPACITY = 0.92
+WIDGET_OPACITY = 0.95
 RESIZE_EDGE = 6  # pixels from edge to trigger resize
 
 # Colors
@@ -237,17 +237,49 @@ def get_latest_claude_version():
 
 LOCK_FILE = CLAUDE_DIR / "widget.lock"
 
+def _is_pid_alive(pid):
+    """Check if a process with the given PID is still running."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
 def ensure_single_instance():
     """Use a lock file to prevent multiple widget instances.
-    Returns the open file handle (kept open to hold the lock), or None."""
+    Returns the open file handle (kept open to hold the lock), or None.
+    Recovers stale locks from dead processes automatically."""
     import msvcrt
     try:
-        # Open or create lock file
         fh = open(LOCK_FILE, "w")
         msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         fh.write(str(os.getpid()))
         fh.flush()
         return fh  # keep open to hold lock
+    except (OSError, IOError):
+        fh.close()
+    # Lock held — check if the owning process is still alive
+    try:
+        old_pid = int(LOCK_FILE.read_text().strip())
+    except (ValueError, OSError):
+        old_pid = None
+    if old_pid and _is_pid_alive(old_pid):
+        return None  # genuinely running
+    # Stale lock — previous process died; force-reclaim
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        return None
+    try:
+        fh = open(LOCK_FILE, "w")
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
     except (OSError, IOError):
         return None
 
@@ -999,13 +1031,21 @@ class UsageWidget:
     def _apply_version(self, local, latest):
         self._local_version = local
         self._latest_version = latest
-        if local:
-            self._version_lbl.config(text=f"v{local}")
-        else:
-            self._version_lbl.config(text="")
         if local and latest and latest != local:
-            self._update_lbl.config(text=f"update: v{latest}", fg=FG_ORANGE)
+            # Newer version available
+            self._version_lbl.config(text=f"yours: v{local}", fg=FG_ORANGE)
+            self._update_lbl.config(text=f"Claude Code v{latest}", fg=FG_ACCENT)
+        elif local:
+            # Up to date
+            self._version_lbl.config(text=f"Claude Code v{local}", fg=FG_DIM)
+            self._update_lbl.config(text="")
+        elif latest:
+            # Local version unknown, but latest is available
+            self._version_lbl.config(text=f"Claude Code v{latest}", fg=FG_DIM)
+            self._update_lbl.config(text="")
         else:
+            # Nothing available
+            self._version_lbl.config(text="")
             self._update_lbl.config(text="")
 
     def run(self):
@@ -1015,5 +1055,16 @@ class UsageWidget:
 if __name__ == "__main__":
     _mutex = ensure_single_instance()
     if _mutex is None:
-        sys.exit(0)  # another instance is already running
+        # Show a brief notification so the user knows why it didn't open
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _r = _tk.Tk()
+            _r.withdraw()
+            _mb.showinfo("Claude Usage Widget",
+                         "Another instance is already running.")
+            _r.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
     UsageWidget().run()
