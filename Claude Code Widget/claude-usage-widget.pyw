@@ -29,6 +29,16 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# ─── DPI awareness (call before any tk window) ──────────────────────────────
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor DPI aware
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()     # fallback (system-level)
+    except Exception:
+        pass
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 CLAUDE_DIR = Path.home() / ".claude"
 STATS_FILE = CLAUDE_DIR / "stats-cache.json"
@@ -109,7 +119,6 @@ def get_active_sessions():
 
 def is_pid_running(pid):
     try:
-        import ctypes
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.OpenProcess(0x1000, False, pid)
         if handle:
@@ -187,7 +196,8 @@ def format_reset_time(iso_str):
     if not iso_str:
         return ""
     try:
-        reset = datetime.fromisoformat(iso_str)
+        # Python 3.10 fromisoformat() doesn't support 'Z' — normalize it
+        reset = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
         delta = reset - now
         total_sec = int(delta.total_seconds())
@@ -243,7 +253,6 @@ LOCK_FILE = CLAUDE_DIR / "widget.lock"
 
 def _is_pid_alive(pid):
     """Check if a process with the given PID is still running."""
-    import ctypes
     kernel32 = ctypes.windll.kernel32
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -473,25 +482,38 @@ class UsageWidget:
             if self.root.state() != "normal":
                 self.root.deiconify()
 
-            # Recover if positioned off-screen
+            # Recover if positioned off-screen (multi-monitor aware)
             x = self.root.winfo_x()
             y = self.root.winfo_y()
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
             w = self.root.winfo_width()
             h = self.root.winfo_height()
+            # Use virtual screen (spans all monitors) via win32 API
+            try:
+                SM_XVIRTUALSCREEN = 76
+                SM_YVIRTUALSCREEN = 77
+                SM_CXVIRTUALSCREEN = 78
+                SM_CYVIRTUALSCREEN = 79
+                user32 = ctypes.windll.user32
+                vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+                vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+                vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            except Exception:
+                vx, vy = 0, 0
+                vw = self.root.winfo_screenwidth()
+                vh = self.root.winfo_screenheight()
             clamped = False
-            if x + w < 20:       # too far left
-                x = 10
+            if x + w < vx + 20:       # too far left
+                x = vx + 10
                 clamped = True
-            if x > sw - 20:      # too far right
-                x = sw - w - 10
+            if x > vx + vw - 20:      # too far right
+                x = vx + vw - w - 10
                 clamped = True
-            if y + h < 20:       # too far up
-                y = 10
+            if y + h < vy + 20:       # too far up
+                y = vy + 10
                 clamped = True
-            if y > sh - 20:      # too far down
-                y = sh - h - 10
+            if y > vy + vh - 20:      # too far down
+                y = vy + vh - h - 10
                 clamped = True
             if clamped:
                 self.root.geometry(f"+{x}+{y}")
@@ -1140,6 +1162,7 @@ class UsageWidget:
 
 
 if __name__ == "__main__":
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     _mutex = ensure_single_instance()
     if _mutex is None:
         # Show a brief notification so the user knows why it didn't open
