@@ -66,6 +66,10 @@ PLAN_NAMES = {
     "default_claude_pro": "Pro",
 }
 
+# Icon path — works for both .pyw (script dir) and PyInstaller .exe (_MEIPASS)
+_BASE_DIR = Path(getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))))
+ICON_FILE = _BASE_DIR / "claude-widget.ico"
+
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 
@@ -254,14 +258,24 @@ def ensure_single_instance():
     Returns the open file handle (kept open to hold the lock), or None.
     Recovers stale locks from dead processes automatically."""
     import msvcrt
-    try:
-        fh = open(LOCK_FILE, "w")
+
+    def _try_lock():
+        """Open (or create) the lock file without truncating, acquire lock, write PID."""
+        mode = "r+" if LOCK_FILE.exists() else "w"
+        fh = open(LOCK_FILE, mode)
         msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        fh.seek(0)
+        fh.truncate()
         fh.write(str(os.getpid()))
         fh.flush()
-        return fh  # keep open to hold lock
+        return fh
+
+    # First attempt
+    try:
+        return _try_lock()
     except (OSError, IOError):
-        fh.close()
+        pass
+
     # Lock held — check if the owning process is still alive
     try:
         old_pid = int(LOCK_FILE.read_text().strip())
@@ -269,17 +283,14 @@ def ensure_single_instance():
         old_pid = None
     if old_pid and _is_pid_alive(old_pid):
         return None  # genuinely running
+
     # Stale lock — previous process died; force-reclaim
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except OSError:
         return None
     try:
-        fh = open(LOCK_FILE, "w")
-        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        fh.write(str(os.getpid()))
-        fh.flush()
-        return fh
+        return _try_lock()
     except (OSError, IOError):
         return None
 
@@ -330,6 +341,11 @@ class UsageWidget:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", WIDGET_OPACITY)
         self.root.configure(bg=BG)
+        if ICON_FILE.exists():
+            self.root.iconbitmap(str(ICON_FILE))
+
+        # Override tkinter's default exception handler to prevent silent crashes
+        self.root.report_callback_exception = self._on_tk_error
 
         # State
         self._mouse_mode = None  # "drag", "resize_left", "resize_right"
@@ -442,6 +458,49 @@ class UsageWidget:
         self._refresh_async()
         self._fetch_usage_async()
         self._check_version_async()
+        self._keepalive()
+
+    # ─── Keepalive — prevent window from going invisible ─────────
+
+    def _keepalive(self):
+        """Re-assert topmost, recover off-screen position, and ensure mapped."""
+        try:
+            # Re-assert always-on-top (Windows can clear this)
+            self.root.attributes("-topmost", False)
+            self.root.attributes("-topmost", True)
+
+            # Ensure window is mapped (not withdrawn/iconified)
+            if self.root.state() != "normal":
+                self.root.deiconify()
+
+            # Recover if positioned off-screen
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            clamped = False
+            if x + w < 20:       # too far left
+                x = 10
+                clamped = True
+            if x > sw - 20:      # too far right
+                x = sw - w - 10
+                clamped = True
+            if y + h < 20:       # too far up
+                y = 10
+                clamped = True
+            if y > sh - 20:      # too far down
+                y = sh - h - 10
+                clamped = True
+            if clamped:
+                self.root.geometry(f"+{x}+{y}")
+                self._persist_state()
+
+            self.root.lift()
+        except Exception:
+            pass
+        self.root.after(60_000, self._keepalive)  # every 60s
 
     def _lock_width(self):
         self.root.minsize(self._widget_width, 0)
@@ -450,6 +509,19 @@ class UsageWidget:
     def _unlock_width(self):
         self.root.minsize(MIN_WIDTH, 0)
         self.root.maxsize(MAX_WIDTH, 2000)
+
+    # ─── Error handling ────────────────────────────────────────────
+
+    def _on_tk_error(self, exc_type, exc_value, exc_tb):
+        """Catch tkinter callback exceptions so mainloop never dies."""
+        try:
+            import traceback
+            err = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            log = CLAUDE_DIR / "widget-error.log"
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}]\n{err}\n")
+        except Exception:
+            pass  # absolute last resort — swallow to keep mainloop alive
 
     # ─── Unified mouse handling ───────────────────────────────────
 
@@ -902,13 +974,22 @@ class UsageWidget:
 
     def _refresh_async(self):
         def _work():
-            stats = load_stats()
-            count, sessions = get_active_sessions()
-            self.root.after(0, self._apply_stats, stats, count, sessions)
+            try:
+                stats = load_stats()
+                count, sessions = get_active_sessions()
+                self.root.after(0, self._apply_stats, stats, count, sessions)
+            except Exception:
+                pass  # logged by _on_tk_error if it reaches mainloop
         threading.Thread(target=_work, daemon=True).start()
         self.root.after(REFRESH_MS, self._refresh_async)
 
     def _apply_stats(self, stats, count, sessions):
+        try:
+            self._apply_stats_inner(stats, count, sessions)
+        except Exception as e:
+            self._on_tk_error(type(e), e, e.__traceback__)
+
+    def _apply_stats_inner(self, stats, count, sessions):
         if count > 0:
             self.live_dot.config(
                 text=f"● {count} live",
@@ -972,19 +1053,22 @@ class UsageWidget:
             return
 
         def _work():
-            data, retry_after = fetch_usage(self._oauth_token)
-            if data:
-                with self._usage_lock:
-                    self._usage_data = data
-                save_usage_cache(data)
-                self.root.after(0, self._apply_usage, data)
-                self.root.after(0, self._hide_rate_limit)
-                self._usage_backoff = USAGE_REFRESH_MS  # reset on success
-            elif retry_after > 0:
-                self.root.after(0, self._show_rate_limit_countdown,
-                                self._usage_backoff // 1000)
-                # Double backoff for next attempt
-                self._usage_backoff = min(self._usage_backoff * 2, 3600_000)
+            try:
+                data, retry_after = fetch_usage(self._oauth_token)
+                if data:
+                    with self._usage_lock:
+                        self._usage_data = data
+                    save_usage_cache(data)
+                    self.root.after(0, self._apply_usage, data)
+                    self.root.after(0, self._hide_rate_limit)
+                    self._usage_backoff = USAGE_REFRESH_MS  # reset on success
+                elif retry_after > 0:
+                    self.root.after(0, self._show_rate_limit_countdown,
+                                    self._usage_backoff // 1000)
+                    # Double backoff for next attempt
+                    self._usage_backoff = min(self._usage_backoff * 2, 3600_000)
+            except Exception:
+                pass
 
         threading.Thread(target=_work, daemon=True).start()
         self.root.after(self._usage_backoff, self._fetch_usage_async)
@@ -1022,9 +1106,12 @@ class UsageWidget:
 
     def _check_version_async(self):
         def _work():
-            local = get_local_claude_version()
-            latest = get_latest_claude_version()
-            self.root.after(0, self._apply_version, local, latest)
+            try:
+                local = get_local_claude_version()
+                latest = get_latest_claude_version()
+                self.root.after(0, self._apply_version, local, latest)
+            except Exception:
+                pass
         threading.Thread(target=_work, daemon=True).start()
         self.root.after(VERSION_CHECK_MS, self._check_version_async)
 
